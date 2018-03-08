@@ -1,0 +1,251 @@
+---
+title: "GSE44001 Reanalysis"
+author: "Hilmar Berger"
+output: 
+ html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: false
+    number_sections: true
+    code_folding: hide
+    
+pdf_document:
+    fig_caption: true
+date: "`r format(Sys.time(), '%d %B, %Y %H:%M:%S')`"
+---
+
+
+```{r, results='hide'}
+rm(list=ls())
+suppressMessages(library(GEOquery))
+suppressMessages(library(limma))
+suppressMessages(library(preprocessCore))
+#library(hgu133plus2.db)
+library(pheatmap)
+suppressMessages(library(survival))
+suppressMessages(library(rms))
+library(knitr)
+
+setwd("/data_genome2/public_data/GSE44001_early_cervical_cancer/analysis/")
+if(FALSE) {
+  gset <- getGEO("GSE44001", GSEMatrix =TRUE)
+  gset_a <- gset[[1]]
+  
+  pheno_a = pData(gset_a)
+  pheno_a$Stage = gsub("Stage: ", "", pheno_a$characteristics_ch1)
+  pheno_a$largest_diameter = as.numeric(gsub("largest diameter: ","", pheno_a$characteristics_ch1.1))
+  pheno_a$disease_free_survival_months = as.numeric(gsub("disease_free_survival_\\(dfs\\)_\\(months\\): ","",pheno_a$characteristics_ch1.2))
+  pheno_a$dfs_status = as.numeric(gsub("status_of_dfs: ", "", pheno_a$characteristics_ch1.3))
+  
+  pData(gset_a) = pheno_a
+  
+  save(gset_a, file="data_GSE44001_full.Rdata")
+} else {
+  load("data_GSE44001_full.Rdata")
+}
+
+pheno_a = pData(gset_a)
+ed = pheno_a
+ed$slide = substr(ed$title, 1, 10)
+```
+
+# Overview
+
+This document describes the data and a limited reanalysis of data set GSE44001 from the publication of Lee YY et al, 2013, Gynecologic Oncology, p. 650-654 (DOI: 10.1016/j.ygyno.2013.10.003).
+
+In the original publication the authors describe the results of a retrospective monocentric study on early cervical cancer with the goal to identify molecular risk factors for progression. 300 patients undergoing standard treatment were included in the analysis after excluding cases without available paraffin blocks, without good quality microarray hybridizations or meeting clinical exclusion criteria. 38 out of 300 patients showed recurrence of the diseases. RNA was extracted from FFPE samples and hybridized to Illumina HumanHT-12 WG-DASL V4.0 R2 gene expression beadchips. Data was analyzed by applying the gradient lasso algorithm to build a prediction model based on a multivariate Cox's proportional hazard model. 
+
+Gene expression data and accompanying clinical data was downloaded from GEO data set GSE44001. 
+According to GEO sample annotations, GE data was processed as follows: 'The intensity of the probes was transformed by binary logarithm and then was normalized using the quantile normalization method.'
+
+We here use the GE data as provided by GEO without further processing. 
+
+# Basic QC
+
+## Distribution of normalized values per sample
+
+```{r, fig.width=18}
+boxplot(exprs(gset_a), outline = F, main="Expression level boxplots across all samples", las=2, cex.names=0.5, ylab="Expression level")
+```
+
+Quantile normalization resulted in a homogenous distribution of expression levels across all samples. 
+
+# Multi Dimensional Scaling of samples to check for batch effects
+
+We here uses MDS to check the similarity of samples and the presence of clusters of batches within the 300 samples. 
+```{r}
+
+# Use the same normalization as the original publication
+expr_norm = exprs(gset_a)
+
+##################################
+cp = palette(rainbow(8))
+sel_samples = colnames(expr_norm) 
+data_inp = t(expr_norm[, sel_samples]) 
+
+d <- dist(data_inp) # euclidean distances between the rows
+fit <- cmdscale(d,eig=TRUE, k=2) # k is the number of dim
+
+# plot solution
+x <- fit$points[,1]
+y <- fit$points[,2]
+plot(x, y, xlab="Coordinate 1", ylab="Coordinate 2", main="Metric MDS, all samples", type="n")
+text(x,y,labels=pheno_a[rownames(data_inp),]$title, col="black", cex = 0.5)
+```
+
+MDS shows two clearly distinct clusters of samples, possibly due to batch effects. We check if those batches correspond to specific array slides (Illumina hybridizes 12 arrays per slide, which would be affected by different hybridization conditions) by plotting the MDS coordinate 1 values for each slide or array.
+
+```{r}
+par(mar=c(9,4,4,2))
+boxplot(x ~ as.character(ed[names(x),]$slide), las=2, ylab="MDS coordinate 1", main="MDS coordinate 1 by array slide, boxplots")
+plot(as.numeric(as.factor(ed[names(x),]$slide)), x, xlab="Array slide index (order as above)", ylab="MDS coordinate 1", main="MDS coordinate 1 by array slide, individual arrays" )
+```
+
+The two plots above show clearly that the clusters as defined by MDS coordinate 1 are strictly linked to 6 array slides which behave differently. This suggests strongly a technical bias in those 6 array slides vs the rest.  
+
+We define Batch 1 as those arrays with negative MDS coordinate 1 value and  Batch 2 for those with positive one. 
+
+```{r}
+ed = merge(ed, as.data.frame(x), by.x=0, by.y=0, all.x=T, sort=F)
+ed$batch = ifelse(ed$x < 0, 1, 2)
+rownames(ed) = ed$Row.names
+```
+
+```{r}
+table(ed$batch, dnn="Batch")
+```
+
+
+### Association of clinical parameters with microarray batches
+
+We now check if the survival status and staging has equal distribution across those two batches. 
+
+```{r}
+table(ed$batch, ed$dfs_status, dnn=c("Batch","Disease free survival status"))
+fisher.test(ed$batch, ed$dfs_status)
+
+table(ed$batch, ed$Stage, dnn=c("Batch","FIGO stage"))
+fisher.test(ed$batch, ed$Stage)
+```
+
+These results show that there is a clear and statistically significant enrichment of progression events in batch 1 vs. batch 2 (23% of cases vs. 10% of cases, respectively). This could pose a problem since batch effects might be captured by the survival model as related to the hazard of observing an event if not properly handled. 
+
+# Model genes from Lee et al
+
+We now check the expression of the survival associated genes and corresponding probes published in Lee et al (Gyn Onc 2013, Table 2) to see if their expression also is associated to the batch. 
+
+## Genes from Table 2 in Lee et al, all probes per gene
+
+
+```{r}
+published_probes = c("ILMN_2339377","ILMN_3243185","ILMN_1774974","ILMN_2120575","ILMN_1710495","ILMN_2396198","ILMN_2178775","ILMN_1813544","ILMN_2123665","ILMN_1687840","ILMN_1743319","ILMN_2388746")
+
+published_probes_anno = fData(gset_a)[published_probes,]
+rownames(published_probes_anno) = published_probes_anno$ID
+```
+
+
+```{r fig.width=18, fig.height=10}
+sel_probes = subset(fData(gset_a), Symbol %in% published_probes_anno$Symbol)
+emat = expr_norm[rownames(sel_probes),]
+row_labels = as.character(fData(gset_a)[rownames(emat),"Symbol"])
+breaks_new = c(-7, seq(-2,2,4/98), 7)
+row_anno = data.frame(row.names = rownames(sel_probes), Table2 = ifelse(rownames(sel_probes) %in% published_probes_anno$ID, "Yes","No"), stringsAsFactors = FALSE )
+col_anno_df = ed[,c("batch","dfs_status"), drop=F]
+col_anno_df$batch = factor(col_anno_df$batch)
+col_anno_df$dfs_status = factor(ifelse(col_anno_df$dfs_status==0, "no event", "event"))
+col_dist_mat = dist(cor(emat, method="spearman", use="pairwise"))
+anno_cols = list("batch"=c("1"="red","2"="blue"), "dfs_status"=c("no event"="lightgreen","event"="black"), "Table2"=c("Yes"="black","No"="white"))
+pheatmap(emat, labels_row = row_labels, scale="row", breaks=breaks_new, annotation_col = col_anno_df, clustering_distance_cols=col_dist_mat, annotation_colors = anno_cols, main="", fontsize=18, show_colnames = FALSE, annotation_row = row_anno)
+```
+
+Interestingly, gene expression values from genes of selected probes in Table 2 clusters samples mainly by batch and less so by recurrence status. 
+
+## Only Probes from Table 2 in Lee et al
+
+We now restrict the analysis to only those probes listed in Table 2 of the original publication. 
+
+```{r fig.width=18, fig.height=8}
+sel_probes = published_probes_anno
+emat = expr_norm[rownames(sel_probes),]
+row_labels = as.character(fData(gset_a)[rownames(emat),"Symbol"])
+breaks_new = c(-7, seq(-2,2,4/98), 7)
+col_anno_df = ed[,c("batch","dfs_status"), drop=F]
+col_anno_df$batch = factor(col_anno_df$batch)
+col_anno_df$dfs_status = factor(ifelse(col_anno_df$dfs_status==0, "no event", "event"))
+anno_cols = list("batch"=c("1"="red","2"="blue"), "dfs_status"=c("no event"="lightgreen","event"="black"))
+
+emat_ordered = emat[,order(ed[colnames(emat),"batch"])]
+pheatmap(emat_ordered, cluster_cols=F, labels_row = row_labels, scale="row", breaks=breaks_new, annotation_col = col_anno_df, annotation_colors = anno_cols, main="", fontsize=18, show_colnames = FALSE)
+```
+
+
+Again, also for only the probes reported in table 2 there seems to be a bias in expression towards Batch 1 for several probes. 
+
+## Boxplots with Mann-Whitney-U tests
+
+We now check for each of the probes reported in the original publication if they show a significant difference in expression values between batches 1 and 2. 
+
+```{r, fig.width=18, fig.height=14}
+par(mfrow=c(3,4), cex.main=1.5, cex.sub=1.8, cex.axis=1.5)
+for (rr in rownames(emat_ordered)) {
+  x = emat_ordered[rr,]
+  tt = wilcox.test(x ~ ed[colnames(emat_ordered),"batch"] )$p.value
+  ptt = paste(published_probes_anno[rr,]$Symbol, " [",rr,"]", sep="")
+  boxplot(x ~ factor(ed[colnames(emat_ordered),"batch"]), sub=paste("MWU p-value=", prettyNum(tt, digits=2)), main=ptt )
+}
+par(mfrow=c(1,1))
+```
+
+
+For both genes and probes from Table 2 in Lee et al, we find that there seems to be a batch effect causing different expression between batches, which finally could be mistaken as DFS related by the survival model used for variable selection. 
+
+# Reanalysis of the survival model while adjusting for batch effect
+
+In order to check if results would be different when adjusting for batch effects we perform a simple Cox regression analysis for each probe with FIGO stage (IA2=Low, other=High) and the batch as covariables, since those are the only available covariates from the GEO data set. 
+
+We show all probes with an adjusted p-value (FDR) of < 10%. 
+
+```{r, results='show', fig.width=18, fig.height=12}
+ed_surv = subset(ed, !is.na(dfs_status))
+ed_surv$SurvObj = with(ed_surv, Surv(disease_free_survival_months, dfs_status))
+ed_surv$FIGO_binary = factor(ifelse(ed_surv$Stage=="IA2", "Low", "High"), levels=c("Low", "High"))
+
+model_func2 <- function(x) { tmp = coxph(ed_surv$SurvObj ~ x[rownames(ed_surv)] + ed_surv$batch); summary(tmp)$coefficients["x[rownames(ed_surv)]",]}
+
+rr = as.data.frame(t(apply(expr_norm, 1, model_func2)))
+rr$padj = p.adjust(rr[,"Pr(>|z|)"], method="BH")
+rr$GeneSymbol = fData(gset_a)[rownames(rr),"Symbol"]
+
+kable(subset(rr, padj < 0.1),format = "pandoc")
+```
+
+Overlap with Table 2 from Lee et al (2013): RERGL, APLP1, PAPLN, DNM2. All other candidates are reported only in this analysis. Please note that SERPINF1 (also known as Pigment epithelium-derived factor (PEDF)) is a known clinically relevant target in cervical cancer due to its potential anti-angiogenic function and shows up here as the strongest favorable factor. 
+
+
+```{r, echo=FALSE, fig.width=18, fig.height=12, eval=FALSE}
+
+sel_probes = fData(gset_a)[rownames(subset(rr, padj < 0.1)),]
+emat = expr_norm[rownames(sel_probes),]
+row_labels = as.character(fData(gset_a)[rownames(emat),"Symbol"])
+breaks_new = c(-7, seq(-2,2,4/98), 7)
+col_anno_df = ed[,c("batch","dfs_status"), drop=F]
+col_anno_df$batch = factor(col_anno_df$batch)
+col_anno_df$dfs_status = factor(ifelse(col_anno_df$dfs_status==0, "no event", "event"))
+col_dist_mat = dist(cor(emat, method="spearman", use="pairwise"))
+anno_cols = list("batch"=c("1"="red","2"="blue"), "dfs_status"=c("no event"="lightgreen","event"="black"))
+#pheatmap(emat, labels_row = row_labels, scale="row", breaks=breaks_new, annotation_col = col_anno_df, clustering_distance_cols=col_dist_mat, annotation_colors = anno_cols, main="")
+
+#emat_ordered = emat[,order(ed[colnames(emat),"batch"])]
+#pheatmap(emat_ordered, cluster_cols=F, labels_row = row_labels, scale="row", breaks=breaks_new, annotation_col = col_anno_df, annotation_colors = anno_cols, main="Ordered by Batch")
+
+emat_ordered = emat[,order(ed[colnames(emat),"dfs_status"])]
+pheatmap(emat_ordered, cluster_cols=F, labels_row = row_labels, scale="row", breaks=breaks_new, annotation_col = col_anno_df, annotation_colors = anno_cols, main="ordered by DFS Status", fontsize = 18, show_colnames = F)
+
+#emat_ordered = emat[,order(ed[colnames(emat),"dfs_status"])]
+#pheatmap(emat_ordered, cluster_cols=F, labels_row = row_labels, scale="none", annotation_col = col_anno_df, annotation_colors = anno_cols, main="Absolute values")
+
+```
+
+
+
